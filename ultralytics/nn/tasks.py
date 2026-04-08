@@ -67,6 +67,8 @@ from ultralytics.nn.modules import (
     DINOv3TripleBackbone,
     DINOv3BackboneWithAdapter,
     P3FeatureEnhancer,
+    DINOv3FPN,
+    DINOv3CrossFusion,
     create_dinov3_backbone,
     WorldDetect,
     v10Detect,
@@ -1098,6 +1100,20 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 # Apply variant scaling to output channels, same as other modules
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
                 args = [args[0], c1, c2, *args[3:]]  # [model_name, input_channels, output_channels, freeze, ...]
+        elif m is DINOv3FPN:
+            # Passthrough: returns input unchanged; c2 = c1
+            # YAML args: [model_name, freeze, image_size]
+            # tasks.py prepends input_channels → [model_name, input_ch, freeze, image_size]
+            c1 = ch[f]
+            c2 = c1  # passthrough – output channels equal input channels
+            args = [args[0], c1, *args[1:]]  # [model_name, input_channels, freeze, image_size]
+        elif m is DINOv3CrossFusion:
+            # Cross-attention fusion; c2 = c1 (residual – same channels in/out)
+            # YAML args: [scale, num_heads]  (optionally [scale, num_heads, dino_dim])
+            # tasks.py prepends channels → [channels, scale, num_heads, ...]
+            c1 = ch[f]
+            c2 = c1  # residual: output channels = input channels
+            args = [c1, *args]  # [channels, scale, num_heads, ...]
         elif m is CBFuse:
             c2 = ch[f[-1]]
         else:

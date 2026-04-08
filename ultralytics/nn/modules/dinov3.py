@@ -11,6 +11,7 @@ HuggingFace models: facebook/dinov3-small, facebook/dinov3-base, facebook/dinov3
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 import warnings
 from typing import Optional, Dict, Any, Tuple, List
@@ -955,3 +956,326 @@ class DINOv3BackboneWithAdapter(nn.Module):
     
     def __repr__(self):
         return f"DINOv3BackboneWithAdapter(DINOv3: {self.dinov3_output_channels}, Target: {self.target_channels})"
+
+
+# ---------------------------------------------------------------------------
+# YOLOv26-GPR: Multi-scale DINOv3 Cross-Attention Architecture
+# ---------------------------------------------------------------------------
+
+class DINOv3FPN(nn.Module):
+    """
+    DINOv3 Feature Pyramid pre-extractor for YOLOv26-GPR.
+
+    Runs DINOv3 once at the start of the backbone, caches intermediate
+    features at three FPN scales (P3 / P4 / P5) so downstream
+    DINOv3CrossFusion layers can retrieve them without re-running ViT.
+
+    This module is a **passthrough**: it returns the raw input tensor
+    unchanged, so the CNN backbone sees the full 9-ch (or 3-ch) image.
+    Channel tracking in parse_model therefore treats c2 = c1.
+
+    YAML usage (backbone layer 0)::
+
+        - [-1, 1, DINOv3FPN, ["facebook/dinov2-small", true, 224]]
+          # args: [model_name, freeze, image_size]
+    """
+
+    _active_instance = None  # class-level pointer; updated every forward pass
+
+    # Map model-name keywords → ViT hidden dim
+    _DIM_MAP = {"large": 1024, "base": 768, "small": 384}
+
+    def __init__(
+        self,
+        model_name: str = "facebook/dinov2-small",
+        input_channels: int = 3,
+        freeze: bool = True,
+        image_size: int = 224,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.input_channels = input_channels
+        self.freeze = freeze
+        self.image_size = image_size
+        # DINOv3 uses patch16, DINOv2 uses patch14
+        self.patch_size = 16 if "dinov3" in model_name.lower() or "vits16" in model_name.lower() or "vitb16" in model_name.lower() or "vitl16" in model_name.lower() else 14
+
+        # ---- load DINO model ------------------------------------------------
+        self.use_timm = False
+        self.dino_model = self._load_dino()
+
+        # ---- feature dimension ----------------------------------------------
+        self.feature_dim = self._get_dim()
+
+        # ---- input channel adapter (e.g. 9-ch GPR → 3-ch) ------------------
+        if input_channels != 3:
+            self.input_adapter = nn.Conv2d(input_channels, 3, 1, bias=False)
+            with torch.no_grad():
+                nn.init.zeros_(self.input_adapter.weight)
+                k = min(input_channels, 3)
+                self.input_adapter.weight[:k, :k, 0, 0] = torch.eye(k)
+        else:
+            self.input_adapter = None
+
+        # ---- freeze ViT weights --------------------------------------------
+        if freeze:
+            for p in self.dino_model.parameters():
+                p.requires_grad = False
+
+        # ---- runtime cache (filled during forward) -------------------------
+        self._cached: dict = {}          # {'p3': tensor, 'p4': tensor, 'p5': tensor}
+        self._cache_key: tuple = ()      # (B, H, W) – invalidate when input changes
+
+    # ------------------------------------------------------------------
+    def _load_dino(self) -> nn.Module:
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                setup_huggingface_auth()
+                token = get_huggingface_token()
+                m = AutoModel.from_pretrained(
+                    self.model_name, trust_remote_code=True, token=token
+                )
+                print(f"✓ DINOv3FPN loaded (HuggingFace): {self.model_name}")
+                return m
+            except Exception as e:
+                print(f"DINOv3FPN: HuggingFace failed ({e}), trying timm…")
+
+        if TIMM_AVAILABLE:
+            _map = {
+                # DINOv2 (patch14)
+                "facebook/dinov2-small":  "vit_small_patch14_dinov2.lvd142m",
+                "facebook/dinov2-base":   "vit_base_patch14_dinov2.lvd142m",
+                "facebook/dinov2-large":  "vit_large_patch14_dinov2.lvd142m",
+                # DINOv3 (patch16) — fall back to DINOv2 weights via timm
+                "facebook/dinov3-small":                    "vit_small_patch14_dinov2.lvd142m",
+                "facebook/dinov3-base":                     "vit_base_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vits16-pretrain-lvd1689m": "vit_small_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vitb16-pretrain-lvd1689m": "vit_base_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vitl16-pretrain-lvd1689m": "vit_large_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vitg16-pretrain-lvd1689m": "vit_giant_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vitl16-pretrain-sat493m":  "vit_large_patch14_dinov2.lvd142m",
+                "facebook/dinov3-vitg16-pretrain-sat493m":  "vit_giant_patch14_dinov2.lvd142m",
+            }
+            name = _map.get(self.model_name, "vit_small_patch14_dinov2.lvd142m")
+            m = timm.create_model(name, pretrained=True, num_classes=0, global_pool="")
+            self.use_timm = True
+            print(f"✓ DINOv3FPN loaded (timm): {name}")
+            return m
+
+        raise RuntimeError(
+            "DINOv3FPN: install 'transformers' or 'timm'.\n"
+            "  pip install transformers huggingface_hub  OR  pip install timm"
+        )
+
+    def _get_dim(self) -> int:
+        if hasattr(self.dino_model, "config"):
+            return self.dino_model.config.hidden_size
+        if hasattr(self.dino_model, "embed_dim"):
+            return self.dino_model.embed_dim
+        # Check by model name keyword (covers both dinov2 and dinov3 naming)
+        n = self.model_name.lower()
+        if "vitl" in n or "large" in n:
+            return 1024
+        if "vitb" in n or "base" in n:
+            return 768
+        if "vitg" in n or "giant" in n:
+            return 1536
+        return 384  # vits / small default
+
+    # ------------------------------------------------------------------
+    def _extract(self, x: torch.Tensor) -> dict:
+        """Run ViT and return {'p3', 'p4', 'p5'} spatial feature maps."""
+        B = x.shape[0]
+        h = w = self.image_size // self.patch_size   # e.g. 224/14 = 16
+
+        with torch.set_grad_enabled(not self.freeze):
+            if not self.use_timm:
+                # HuggingFace path: output_hidden_states=True
+                out = self.dino_model(x, output_hidden_states=True)
+                hs = out.hidden_states   # tuple([B, 1+N, D]) including CLS
+                n = len(hs)
+                layers = {
+                    "p3": hs[max(1, n // 3)][:, 1:, :],          # early
+                    "p4": hs[max(1, 2 * n // 3)][:, 1:, :],      # mid
+                    "p5": hs[-1][:, 1:, :],                       # final
+                }
+            else:
+                # timm path
+                if hasattr(self.dino_model, "get_intermediate_layers"):
+                    nb = len(self.dino_model.blocks)
+                    idxs = [nb // 3 - 1, 2 * nb // 3 - 1, nb - 1]
+                    feats = self.dino_model.get_intermediate_layers(x, n=idxs)
+                    layers = {"p3": feats[0], "p4": feats[1], "p5": feats[2]}
+                else:
+                    f = self.dino_model.forward_features(x)
+                    if f.dim() == 3:
+                        f = f[:, 1:, :]    # remove CLS
+                    layers = {"p3": f, "p4": f, "p5": f}
+
+        D = self.feature_dim
+
+        def to_spatial(t):
+            # t: [B, N, D]  →  [B, D, sq, sq]
+            n = t.shape[1]
+            sq = int(n ** 0.5)
+            t = t[:, : sq * sq, :]
+            return t.transpose(1, 2).reshape(B, D, sq, sq)
+
+        return {k: to_spatial(v) for k, v in layers.items()}
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Cache DINOv3 multi-scale features; return input unchanged."""
+        B, C, H, W = x.shape
+        key = (B, H, W)
+
+        # Adapt input channels for ViT
+        if self.input_adapter is not None:
+            dino_x = self.input_adapter(x)
+        elif C != 3:
+            dino_x = x[:, :3]
+        else:
+            dino_x = x
+
+        # Resize to ViT input size
+        if H != self.image_size or W != self.image_size:
+            dino_x = F.interpolate(
+                dino_x, size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False
+            )
+
+        if self.freeze:
+            self.dino_model.eval()
+
+        self._cached = self._extract(dino_x)
+        self._cache_key = key
+        DINOv3FPN._active_instance = self   # publish for DINOv3CrossFusion
+
+        return x   # passthrough
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze and self.dino_model is not None:
+            self.dino_model.eval()
+        return self
+
+    def __repr__(self):
+        return (
+            f"DINOv3FPN(model={self.model_name!r}, "
+            f"dim={self.feature_dim}, freeze={self.freeze})"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+class DINOv3CrossFusion(nn.Module):
+    """
+    Cross-attention fusion between CNN features and DINOv3 FPN features.
+
+    Retrieves cached features from ``DINOv3FPN._active_instance`` and
+    enhances CNN features via::
+
+        out = CNN_feat + γ · CrossAttn(Q=CNN, K=V=DINOv3)
+
+    The learnable scale ``γ`` (``nn.Parameter``) is initialised to 0,
+    meaning at the start of training the module behaves like an identity;
+    it gradually learns to blend ViT knowledge into the CNN stream.
+
+    Must be preceded in the backbone by a ``DINOv3FPN`` layer.
+    Falls back to identity if DINOv3FPN has not run yet (e.g. debugging).
+
+    YAML usage::
+
+        - [-1, 1, DINOv3CrossFusion, ["p3", 4]]
+          # args: [scale, num_heads]   (channels prepended by tasks.py)
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        scale: str = "p3",
+        num_heads: int = 4,
+        dino_dim: int = 384,        # ViT-S=384, ViT-B=768, ViT-L=1024
+    ):
+        super().__init__()
+        self.channels = channels
+        self.scale = scale
+        self.num_heads = num_heads
+        self.dino_dim = dino_dim
+
+        # Project DINOv3 features to CNN channel space
+        self.dino_proj = nn.Sequential(
+            nn.Conv2d(dino_dim, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+        )
+
+        # Normalisation before attention
+        self.norm_q = nn.LayerNorm(channels)
+        self.norm_k = nn.LayerNorm(channels)
+
+        # Multi-head cross-attention (Q from CNN, K/V from DINOv3)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=channels,
+            num_heads=max(1, num_heads),
+            batch_first=True,
+            dropout=0.0,
+        )
+
+        # Output conv + residual gate (γ=0 at init → identity at start)
+        self.out_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        for seq in [self.dino_proj]:
+            for m in seq:
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out")
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: CNN feature map  [B, C, H, W]
+        Returns:
+            DINOv3-enhanced feature map  [B, C, H, W]
+        """
+        B, C, H, W = x.shape
+
+        fpn = DINOv3FPN._active_instance
+        if fpn is None or self.scale not in fpn._cached:
+            return x   # safety fallback
+
+        dino_feat = fpn._cached[self.scale].to(x.device)   # [B, D, h, w]
+
+        # Project DINOv3 dim → CNN channels
+        dino_feat = self.dino_proj(dino_feat)               # [B, C, h, w]
+
+        # Resize DINOv3 spatial map to match CNN feature size
+        if dino_feat.shape[-2:] != (H, W):
+            dino_feat = F.interpolate(
+                dino_feat, size=(H, W), mode="bilinear", align_corners=False
+            )
+
+        # ---- Cross-attention: Q from CNN, K/V from DINOv3 ----------------
+        # Q: [B, H*W, C]   K,V: [B, H*W, C]
+        q  = x.flatten(2).transpose(1, 2)           # [B, N_q, C]
+        kv = dino_feat.flatten(2).transpose(1, 2)   # [B, N_kv, C]
+
+        q  = self.norm_q(q)
+        kv = self.norm_k(kv)
+
+        attn_out, _ = self.cross_attn(q, kv, kv)    # [B, N_q, C]
+        attn_out = attn_out.transpose(1, 2).reshape(B, C, H, W)
+        attn_out = self.out_proj(attn_out)
+
+        return x + self.gamma * attn_out
+
+    def __repr__(self):
+        return (
+            f"DINOv3CrossFusion(ch={self.channels}, scale={self.scale!r}, "
+            f"heads={self.num_heads}, dino_dim={self.dino_dim})"
+        )

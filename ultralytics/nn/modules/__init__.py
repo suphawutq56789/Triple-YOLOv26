@@ -81,6 +81,8 @@ from .dinov3 import (
     DINOv3TripleBackbone,
     DINOv3BackboneWithAdapter,
     P3FeatureEnhancer,
+    DINOv3FPN,
+    DINOv3CrossFusion,
     create_dinov3_backbone,
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
@@ -175,5 +177,7 @@ __all__ = (
     "DINOv3TripleBackbone",
     "DINOv3BackboneWithAdapter",
     "P3FeatureEnhancer",
+    "DINOv3FPN",
+    "DINOv3CrossFusion",
     "create_dinov3_backbone",
 )
