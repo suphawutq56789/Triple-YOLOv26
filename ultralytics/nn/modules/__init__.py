@@ -83,6 +83,8 @@ from .dinov3 import (
     P3FeatureEnhancer,
     DINOv3FPN,
     DINOv3CrossFusion,
+    MedSAMFPN,
+    MedSAMCrossFusion,
     create_dinov3_backbone,
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
@@ -179,5 +181,7 @@ __all__ = (
     "P3FeatureEnhancer",
     "DINOv3FPN",
     "DINOv3CrossFusion",
+    "MedSAMFPN",
+    "MedSAMCrossFusion",
     "create_dinov3_backbone",
 )

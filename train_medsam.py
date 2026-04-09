@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+Training script for YOLOv26-GPR-MedSAM
+Architecture: YOLOv26 CNN + MedSAM ViT-B Multi-Scale Cross-Attention FPN
+Task: GPR subsurface void (Cavity) detection
+Dataset: ~2700 images, triple 9-channel input, 3 scan orientations
+
+Domain rationale:
+    MedSAM was trained on 1.5M medical images including ultrasound.
+    Ultrasound and GPR share the same pulse-echo physics:
+      - hyperbolic diffraction patterns from point reflectors
+      - layered reflections from material interfaces
+      - speckle/clutter noise, void = signal dropout
+    This gives MedSAM far better feature transfer to GPR than DINOv3
+    which was trained on natural RGB photographs.
+
+Training phases:
+    Phase 1 — MedSAM frozen (87.3M params frozen)
+        Train only CNN backbone + MedSAMCrossFusion layers (3.4M params)
+        γ starts at 0 → model first learns to detect without MedSAM
+        γ gradually increases → MedSAM features blend in
+
+    Phase 2 — MedSAM unfrozen (optional, needs ≥8GB VRAM)
+        Fine-tune all layers with 10x lower LR
+        Allows ViT to adapt to GPR domain from medical domain
+
+Usage:
+    python train_medsam.py                        # scale=s, 100 epochs phase1
+    python train_medsam.py --scale m              # larger model
+    python train_medsam.py --epochs 150 --batch 8
+    python train_medsam.py --phase2               # run phase2 after phase1
+    python train_medsam.py --weights runs/gpr_medsam/phase1_s/weights/best.pt --phase2
+    python train_medsam.py --compare              # compare vs DINOv3 version
+"""
+
+import argparse
+import warnings
+from pathlib import Path
+from ultralytics import YOLO
+
+warnings.filterwarnings("ignore")
+
+DATA_CONFIG       = "data_all.yaml"
+MODEL_CONFIG      = "ultralytics/cfg/models/v26/yolov26_gpr_medsam.yaml"
+DINOV3_CONFIG     = "ultralytics/cfg/models/v26/yolov26_gpr.yaml"   # for comparison
+PROJECT           = "runs/gpr_medsam"
+
+# GPR-safe augmentation rules (same for both phases)
+# - NO vertical flip  → destroys depth ordering in B-scan
+# - NO rotation       → destroys hyperbola shape
+# - NO HSV hue/sat    → GPR is amplitude-only, not color
+GPR_AUG = dict(
+    fliplr=0.5,
+    flipud=0.0,
+    degrees=0.0,
+    translate=0.1,
+    scale=0.3,
+    shear=0.0,
+    perspective=0.0,
+    hsv_h=0.0,
+    hsv_s=0.0,
+    hsv_v=0.2,
+)
+
+
+# ---------------------------------------------------------------------------
+
+def print_banner(title: str):
+    print()
+    print("=" * 65)
+    print(f"  {title}")
+    print("=" * 65)
+
+
+def gamma_report(model):
+    """Print current γ values of all CrossFusion layers."""
+    from ultralytics.nn.modules import MedSAMCrossFusion
+    gammas = []
+    for name, m in model.model.named_modules():
+        if isinstance(m, MedSAMCrossFusion):
+            g = m.gamma.item()
+            gammas.append((name, m.scale, g))
+    if gammas:
+        print("\n  MedSAMCrossFusion γ values:")
+        for name, scale, g in gammas:
+            bar = "█" * int(abs(g) * 20)
+            print(f"    {scale:3s}  γ={g:.4f}  {bar}")
+
+
+# ---------------------------------------------------------------------------
+
+def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "") -> Path:
+    """
+    Phase 1: MedSAM ViT-B frozen.
+    Train only CNN backbone + MedSAMCrossFusion layers.
+
+    γ=0 init means the model starts as pure YOLOv26 CNN,
+    then gradually learns to use MedSAM features via γ.
+    """
+    run_name = f"phase1_{scale}{name_suffix}"
+    print_banner(f"PHASE 1  |  scale={scale}  epochs={epochs}  batch={batch}  imgsz={imgsz}")
+    print("  MedSAM ViT-B: FROZEN (87.3M params)")
+    print("  Training:     CNN backbone + MedSAMCrossFusion (3.4M params)")
+    print("  γ starts at 0 → identity; opens gradually during training")
+
+    model = YOLO(MODEL_CONFIG)
+
+    # Report initial γ (should all be 0.0)
+    gamma_report(model)
+
+    model.train(
+        data=DATA_CONFIG,
+        epochs=epochs,
+        imgsz=imgsz,
+        batch=batch,
+
+        # Optimizer — AdamW works well for small datasets
+        optimizer="AdamW",
+        lr0=0.002,
+        lrf=0.01,
+        weight_decay=0.01,
+        warmup_epochs=5,
+
+        # Loss weights (single class: emphasise box quality)
+        box=7.5,
+        cls=0.5,
+        dfl=1.5,
+
+        # GPR-safe augmentation
+        **GPR_AUG,
+        mosaic=1.0,
+        copy_paste=0.3,      # paste extra void patches — helps rare class
+
+        # Logging
+        project=PROJECT,
+        name=run_name,
+        exist_ok=True,
+        plots=True,
+        save_period=20,
+        patience=30,
+        verbose=True,
+    )
+
+    # Report final γ — shows how much MedSAM was actually used
+    print("\n  Final γ after Phase 1:")
+    gamma_report(model)
+
+    best = Path(f"{PROJECT}/{run_name}/weights/best.pt")
+    print(f"\n  Phase 1 done → {best}")
+    return best
+
+
+# ---------------------------------------------------------------------------
+
+def phase2(weights: str, epochs: int, batch: int, imgsz: int, scale: str,
+           name_suffix: str = "") -> Path:
+    """
+    Phase 2: Unfreeze MedSAM ViT-B for domain adaptation.
+    Fine-tune all layers with 10x lower LR.
+
+    Recommended only if:
+      - GPU VRAM ≥ 8GB (ViT-B at 512×512 is memory-heavy)
+      - Phase 1 converged well (γ > 0.1 on at least one scale)
+    """
+    run_name = f"phase2_{scale}{name_suffix}"
+    print_banner(f"PHASE 2  |  fine-tune from {weights}")
+    print("  MedSAM ViT-B: UNFROZEN — domain adaptation GPR←medical")
+    print("  LR: 10x lower than Phase 1  (prevent catastrophic forgetting)")
+
+    model = YOLO(weights)
+
+    # Unfreeze MedSAM ViT weights
+    from ultralytics.nn.modules import MedSAMFPN
+    unfrozen_params = 0
+    for layer in model.model.model:
+        if isinstance(layer, MedSAMFPN):
+            layer.freeze = False
+            for p in layer.vit.parameters():
+                p.requires_grad = True
+            unfrozen_params = sum(p.numel() for p in layer.vit.parameters())
+            print(f"  Unfroze MedSAMFPN ViT — {unfrozen_params/1e6:.1f}M params now trainable")
+
+    total_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    print(f"  Total trainable: {total_trainable/1e6:.1f}M params")
+
+    model.train(
+        data=DATA_CONFIG,
+        epochs=epochs,
+        imgsz=imgsz,
+        batch=batch,
+
+        # 10x lower LR — prevents catastrophic forgetting of medical features
+        optimizer="AdamW",
+        lr0=0.0002,
+        lrf=0.01,
+        weight_decay=0.005,
+        warmup_epochs=3,
+
+        box=7.5,
+        cls=0.5,
+        dfl=1.5,
+
+        # Lighter augmentation in phase 2
+        **GPR_AUG,
+        mosaic=0.5,
+        copy_paste=0.1,
+
+        project=PROJECT,
+        name=run_name,
+        exist_ok=True,
+        plots=True,
+        save_period=10,
+        patience=20,
+        verbose=True,
+    )
+
+    best = Path(f"{PROJECT}/{run_name}/weights/best.pt")
+    print(f"\n  Phase 2 done → {best}")
+    return best
+
+
+# ---------------------------------------------------------------------------
+
+def compare(scale: str, epochs: int, batch: int, imgsz: int):
+    """
+    Run both MedSAM and DINOv3 versions back-to-back for fair comparison.
+    Results saved in runs/gpr_medsam/compare_*/
+    """
+    print_banner("COMPARISON: MedSAM vs DINOv3")
+    print("  Both models trained with identical hyperparameters")
+    print("  Check runs/gpr_medsam/ for results")
+
+    results = {}
+
+    # --- MedSAM ---
+    print_banner("  [1/2] YOLOv26 + MedSAM ViT-B")
+    model_m = YOLO(MODEL_CONFIG)
+    model_m.train(
+        data=DATA_CONFIG, epochs=epochs, imgsz=imgsz, batch=batch,
+        optimizer="AdamW", lr0=0.002, lrf=0.01, weight_decay=0.01,
+        warmup_epochs=5, box=7.5, cls=0.5, dfl=1.5,
+        **GPR_AUG, mosaic=1.0, copy_paste=0.3,
+        project=PROJECT, name=f"compare_medsam_{scale}",
+        exist_ok=True, plots=True, patience=30,
+    )
+    results["MedSAM"] = Path(f"{PROJECT}/compare_medsam_{scale}/weights/best.pt")
+
+    # --- DINOv3 ---
+    print_banner("  [2/2] YOLOv26 + DINOv3 ViT-S")
+    model_d = YOLO(DINOV3_CONFIG)
+    model_d.train(
+        data=DATA_CONFIG, epochs=epochs, imgsz=imgsz, batch=batch,
+        optimizer="AdamW", lr0=0.002, lrf=0.01, weight_decay=0.01,
+        warmup_epochs=5, box=7.5, cls=0.5, dfl=1.5,
+        **GPR_AUG, mosaic=1.0, copy_paste=0.3,
+        project=PROJECT, name=f"compare_dinov3_{scale}",
+        exist_ok=True, plots=True, patience=30,
+    )
+    results["DINOv3"] = Path(f"{PROJECT}/compare_dinov3_{scale}/weights/best.pt")
+
+    print_banner("COMPARISON DONE")
+    for name, path in results.items():
+        print(f"  {name}: {path}")
+    print()
+    print("  Compare mAP50 in runs/gpr_medsam/compare_*/results.csv")
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train YOLOv26-GPR-MedSAM void detector",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python train_medsam.py                              # phase 1 only, scale s
+  python train_medsam.py --scale m --epochs 150       # larger model
+  python train_medsam.py --phase2                     # phase 1 then phase 2
+  python train_medsam.py --weights best.pt --phase2   # skip to phase 2
+  python train_medsam.py --compare                    # MedSAM vs DINOv3
+        """
+    )
+    parser.add_argument("--scale",    default="s",  choices=["n", "s", "m", "l"],
+                        help="Model scale (s=recommended for ~2700 imgs, m=better but slower)")
+    parser.add_argument("--epochs",   type=int, default=100,
+                        help="Epochs for phase 1 (phase 2 uses epochs//2)")
+    parser.add_argument("--batch",    type=int, default=16,
+                        help="Batch size (reduce if OOM, phase 2 uses batch//2 automatically)")
+    parser.add_argument("--imgsz",    type=int, default=640,
+                        help="YOLO input image size (MedSAM resizes internally to 512)")
+    parser.add_argument("--phase2",   action="store_true",
+                        help="Run phase 2 (unfreeze MedSAM) after phase 1")
+    parser.add_argument("--weights",  default=None,
+                        help="Start from existing weights (skips phase 1, goes to phase 2)")
+    parser.add_argument("--compare",  action="store_true",
+                        help="Run comparison: MedSAM vs DINOv3 with same hyperparams")
+    args = parser.parse_args()
+
+    print_banner("YOLOv26-GPR-MedSAM Training")
+    print(f"  Model:    {MODEL_CONFIG}")
+    print(f"  Data:     {DATA_CONFIG}")
+    print(f"  Scale:    {args.scale}")
+    print(f"  Epochs:   {args.epochs}")
+    print(f"  Batch:    {args.batch}")
+    print(f"  ImgSz:    {args.imgsz}")
+    print(f"  Project:  {PROJECT}/")
+
+    if args.compare:
+        compare(args.scale, args.epochs, args.batch, args.imgsz)
+
+    elif args.weights:
+        # Jump straight to phase 2 from existing checkpoint
+        phase2(
+            weights=args.weights,
+            epochs=max(30, args.epochs // 2),
+            batch=max(1, args.batch // 2),
+            imgsz=args.imgsz,
+            scale=args.scale,
+        )
+
+    else:
+        best = phase1(args.scale, args.epochs, args.batch, args.imgsz)
+
+        if args.phase2 and best.exists():
+            phase2(
+                weights=str(best),
+                epochs=max(30, args.epochs // 2),
+                batch=max(1, args.batch // 2),
+                imgsz=args.imgsz,
+                scale=args.scale,
+            )
+        elif args.phase2:
+            print(f"\n  WARNING: phase 1 weights not found at {best}")
+            print("  Skipping phase 2.")
+
+
+if __name__ == "__main__":
+    main()

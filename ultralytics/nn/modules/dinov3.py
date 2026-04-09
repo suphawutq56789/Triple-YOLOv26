@@ -1279,3 +1279,373 @@ class DINOv3CrossFusion(nn.Module):
             f"DINOv3CrossFusion(ch={self.channels}, scale={self.scale!r}, "
             f"heads={self.num_heads}, dino_dim={self.dino_dim})"
         )
+
+
+# ---------------------------------------------------------------------------
+# YOLOv26-GPR: MedSAM ViT-B Feature Pyramid (Medical Domain Backbone)
+# ---------------------------------------------------------------------------
+
+class MedSAMFPN(nn.Module):
+    """
+    MedSAM ViT-B feature pyramid pre-extractor for YOLOv26-GPR.
+
+    Loads MedSAM image encoder (ViT-B, trained on 1.5M medical images
+    including ultrasound — closest public domain to GPR).  Runs ViT once,
+    caches P3/P4/P5 features via forward hooks, then returns the original
+    input unchanged (passthrough) so the CNN backbone sees the full image.
+
+    Domain rationale:
+        Ultrasound ≈ GPR: both use pulse-echo wave physics, produce
+        hyperbolic diffraction patterns, and contain layered reflections.
+        MedSAM features therefore transfer far better than DINOv3 natural-
+        image features.
+
+    YAML usage (backbone layer 0)::
+
+        - [-1, 1, MedSAMFPN, ["wanglab/medsam-vit-base", true, 512]]
+          # args: [checkpoint, freeze, image_size]
+          # image_size 512 = good speed/quality trade-off (MedSAM native=1024)
+    """
+
+    _active_instance = None   # class-level pointer; updated every forward
+    FEATURE_DIM = 768         # ViT-B hidden dim (fixed)
+    PATCH_SIZE  = 16          # SAM uses patch16
+
+    def __init__(
+        self,
+        checkpoint: str = "wanglab/medsam-vit-base",
+        input_channels: int = 3,
+        freeze: bool = True,
+        image_size: int = 512,
+    ):
+        super().__init__()
+        self.checkpoint    = checkpoint
+        self.input_channels = input_channels
+        self.freeze        = freeze
+        self.image_size    = image_size
+        self.feature_dim   = self.FEATURE_DIM
+        self.patch_size    = self.PATCH_SIZE
+        self.use_timm      = False
+
+        # ---- input channel adapter (9-ch GPR → 3-ch for ViT) ---------------
+        if input_channels != 3:
+            self.input_adapter = nn.Conv2d(input_channels, 3, 1, bias=False)
+            with torch.no_grad():
+                nn.init.zeros_(self.input_adapter.weight)
+                k = min(input_channels, 3)
+                self.input_adapter.weight[:k, :k, 0, 0] = torch.eye(k)
+        else:
+            self.input_adapter = None
+
+        # ---- load MedSAM ViT-B image encoder --------------------------------
+        self._hook_outputs: dict = {}
+        self.vit = self._load_vit()
+
+        # ---- register hooks at P3 / P4 / P5 ViT depths ---------------------
+        self._hooks = []
+        self._register_hooks()
+
+        # ---- freeze ---------------------------------------------------------
+        if freeze:
+            for p in self.vit.parameters():
+                p.requires_grad = False
+
+        # ---- runtime cache --------------------------------------------------
+        self._cached: dict  = {}
+        self._cache_key: tuple = ()
+
+    # ------------------------------------------------------------------
+    def _load_vit(self) -> nn.Module:
+        """Load MedSAM image encoder.  Priority: HF SamModel → timm → error."""
+
+        # --- HuggingFace path (SamModel) -------------------------------------
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                setup_huggingface_auth()
+                token = get_huggingface_token()
+                from transformers import SamModel
+                full = SamModel.from_pretrained(
+                    self.checkpoint, trust_remote_code=True, token=token
+                )
+                vit = full.vision_encoder   # SamVisionEncoder
+                # SamVisionEncoder enforces exact 1024×1024 — resize pos_embed
+                # so we can use a smaller image_size (e.g. 512) without error
+                self._resize_pos_embed_hf(vit, self.image_size)
+                print(f"✓ MedSAMFPN loaded (HuggingFace): {self.checkpoint}")
+                return vit
+            except Exception as e:
+                print(f"MedSAMFPN: HuggingFace failed ({e}), trying timm…")
+
+        # --- timm path (samvit_base_patch16) ---------------------------------
+        # NOTE: timm loads SAM-pretrained weights (not MedSAM fine-tune)
+        # but the architecture is identical — acceptable fallback
+        if TIMM_AVAILABLE:
+            try:
+                m = timm.create_model(
+                    "samvit_base_patch16",
+                    pretrained=True,
+                    num_classes=0,
+                    global_pool="",
+                )
+                self.use_timm = True
+                print("✓ MedSAMFPN loaded (timm): samvit_base_patch16")
+                return m
+            except Exception as e:
+                print(f"MedSAMFPN: timm failed ({e})")
+
+        raise RuntimeError(
+            "MedSAMFPN: cannot load MedSAM. Install dependencies:\n"
+            "  pip install transformers huggingface_hub   (recommended)\n"
+            "  OR  pip install timm>=0.9"
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resize_pos_embed_hf(vit, target_size: int):
+        """
+        Interpolate SamVisionEncoder absolute pos_embed to support
+        a custom input size (default MedSAM native = 1024).
+
+        pos_embed shape: [1, H_grid, W_grid, D]  where H_grid = native // patch_size
+        After this call vit.image_size is patched so the size-check passes.
+        """
+        native = 1024
+        patch  = 16
+        if target_size == native:
+            return
+
+        if not hasattr(vit, "pos_embed") or vit.pos_embed is None:
+            # Just patch the size check — no learnable pos_embed to resize
+            vit.image_size = (target_size, target_size)
+            return
+
+        orig_grid = native    // patch   # 64
+        tgt_grid  = target_size // patch   # e.g. 32 for 512
+
+        pe = vit.pos_embed.data                   # [1, orig_grid, orig_grid, D]
+        pe = pe.permute(0, 3, 1, 2)               # [1, D, orig_grid, orig_grid]
+        pe = F.interpolate(
+            pe.float(),
+            size=(tgt_grid, tgt_grid),
+            mode="bicubic",
+            align_corners=False,
+        )
+        pe = pe.permute(0, 2, 3, 1).contiguous()  # [1, tgt_grid, tgt_grid, D]
+        vit.pos_embed = nn.Parameter(pe)
+
+        # Patch all image_size attributes so the internal size checks pass
+        vit.image_size = (target_size, target_size)
+        if hasattr(vit, "patch_embed") and hasattr(vit.patch_embed, "image_size"):
+            vit.patch_embed.image_size = (target_size, target_size)
+        # Patch any nested image_size inside attention layers
+        for module in vit.modules():
+            if hasattr(module, "image_size") and module is not vit:
+                try:
+                    module.image_size = (target_size, target_size)
+                except Exception:
+                    pass
+        print(f"  MedSAMFPN: pos_embed resized {orig_grid}×{orig_grid} → {tgt_grid}×{tgt_grid}")
+
+    # ------------------------------------------------------------------
+    def _register_hooks(self):
+        """Attach forward hooks at 1/3, 2/3, and final ViT blocks."""
+
+        def _make_hook(name: str):
+            def hook(module, input, output):
+                # HF SamVisionEncoderLayer  → output is (hidden_states, ...)
+                # timm ViT block             → output is hidden_states tensor
+                t = output[0] if isinstance(output, (tuple, list)) else output
+                self._hook_outputs[name] = t
+            return hook
+
+        if self.use_timm:
+            blocks = self.vit.blocks
+        else:
+            # HuggingFace SamVisionEncoder exposes .layers
+            blocks = self.vit.layers
+
+        nb = len(blocks)
+        indices = {
+            "p3": max(0, nb // 3 - 1),
+            "p4": max(0, 2 * nb // 3 - 1),
+            "p5": nb - 1,
+        }
+        for scale, idx in indices.items():
+            h = blocks[idx].register_forward_hook(_make_hook(scale))
+            self._hooks.append(h)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_spatial(t: torch.Tensor, B: int) -> torch.Tensor:
+        """
+        Convert ViT block output to [B, C, H, W].
+
+        SAM/MedSAM window-attention layers emit [B, H, W, C].
+        timm ViT blocks emit [B, N, C] (flattened tokens).
+        """
+        if t.dim() == 4:          # [B, H, W, C]  — SAM spatial format
+            return t.permute(0, 3, 1, 2).contiguous()
+        elif t.dim() == 3:        # [B, N, C]  — standard ViT token format
+            N, C = t.shape[1], t.shape[2]
+            sq = int(N ** 0.5)
+            return t[:, :sq * sq, :].transpose(1, 2).reshape(B, C, sq, sq)
+        return t
+
+    # ------------------------------------------------------------------
+    def _extract(self, x: torch.Tensor) -> dict:
+        """Run ViT (triggers hooks) and convert cached outputs to spatial maps."""
+        self._hook_outputs.clear()
+        B = x.shape[0]
+
+        with torch.set_grad_enabled(not self.freeze):
+            if self.use_timm:
+                self.vit.forward_features(x)
+            else:
+                self.vit(x)   # HF SamVisionEncoder forward
+
+        return {
+            k: self._to_spatial(v, B)
+            for k, v in self._hook_outputs.items()
+        }
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Cache MedSAM multi-scale features; return input unchanged."""
+        B, C, H, W = x.shape
+
+        # Adapt 9-ch input for ViT
+        if self.input_adapter is not None:
+            vit_x = self.input_adapter(x)
+        elif C != 3:
+            vit_x = x[:, :3]
+        else:
+            vit_x = x
+
+        # Resize to ViT input size
+        if H != self.image_size or W != self.image_size:
+            vit_x = F.interpolate(
+                vit_x, size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False
+            )
+
+        if self.freeze:
+            self.vit.eval()
+
+        self._cached   = self._extract(vit_x)
+        self._cache_key = (B, H, W)
+        MedSAMFPN._active_instance = self   # publish for MedSAMCrossFusion
+
+        return x   # passthrough
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze and self.vit is not None:
+            self.vit.eval()
+        return self
+
+    def __repr__(self):
+        return (
+            f"MedSAMFPN(ckpt={self.checkpoint!r}, "
+            f"dim={self.feature_dim}, freeze={self.freeze}, "
+            f"img_size={self.image_size})"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+class MedSAMCrossFusion(nn.Module):
+    """
+    Cross-attention fusion: CNN features (Q) × MedSAM features (K, V).
+
+    Drop-in replacement for DINOv3CrossFusion.  Reads cached features from
+    ``MedSAMFPN._active_instance`` instead of ``DINOv3FPN``.
+
+    out = CNN_feat + γ · CrossAttn(Q=CNN, K=V=MedSAM)
+
+    γ is initialised to 0 (identity at training start), so the module is
+    safe even if MedSAM features are not yet useful.
+
+    YAML usage::
+
+        - [-1, 1, MedSAMCrossFusion, ["p3", 4]]
+          # args: [scale, num_heads]
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        scale: str = "p3",
+        num_heads: int = 4,
+        medsam_dim: int = 768,   # ViT-B = 768 (fixed for MedSAM)
+    ):
+        super().__init__()
+        self.channels   = channels
+        self.scale      = scale
+        self.num_heads  = num_heads
+        self.medsam_dim = medsam_dim
+
+        # Project MedSAM dim (768) → CNN channel space
+        self.medsam_proj = nn.Sequential(
+            nn.Conv2d(medsam_dim, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+        )
+
+        self.norm_q = nn.LayerNorm(channels)
+        self.norm_k = nn.LayerNorm(channels)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=channels,
+            num_heads=max(1, num_heads),
+            batch_first=True,
+            dropout=0.0,
+        )
+
+        self.out_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.gamma    = nn.Parameter(torch.zeros(1))   # γ=0 init
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        for m in self.medsam_proj:
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+
+        fpn = MedSAMFPN._active_instance
+        if fpn is None or self.scale not in fpn._cached:
+            return x   # safety fallback
+
+        med_feat = fpn._cached[self.scale].to(x.device)   # [B, D, h, w]
+
+        # Project 768 → CNN channels
+        med_feat = self.medsam_proj(med_feat)              # [B, C, h, w]
+
+        # Resize MedSAM spatial map → CNN feature size
+        if med_feat.shape[-2:] != (H, W):
+            med_feat = F.interpolate(
+                med_feat, size=(H, W), mode="bilinear", align_corners=False
+            )
+
+        # Cross-attention: Q=CNN, K=V=MedSAM
+        q  = x.flatten(2).transpose(1, 2)          # [B, N, C]
+        kv = med_feat.flatten(2).transpose(1, 2)   # [B, N, C]
+
+        q  = self.norm_q(q)
+        kv = self.norm_k(kv)
+
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        attn_out = attn_out.transpose(1, 2).reshape(B, C, H, W)
+        attn_out = self.out_proj(attn_out)
+
+        return x + self.gamma * attn_out
+
+    def __repr__(self):
+        return (
+            f"MedSAMCrossFusion(ch={self.channels}, scale={self.scale!r}, "
+            f"heads={self.num_heads}, medsam_dim={self.medsam_dim})"
+        )

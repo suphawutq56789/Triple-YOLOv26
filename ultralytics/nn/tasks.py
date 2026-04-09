@@ -69,6 +69,8 @@ from ultralytics.nn.modules import (
     P3FeatureEnhancer,
     DINOv3FPN,
     DINOv3CrossFusion,
+    MedSAMFPN,
+    MedSAMCrossFusion,
     create_dinov3_backbone,
     WorldDetect,
     v10Detect,
@@ -1113,6 +1115,20 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             # tasks.py prepends channels → [channels, scale, num_heads, ...]
             c1 = ch[f]
             c2 = c1  # residual: output channels = input channels
+            args = [c1, *args]  # [channels, scale, num_heads, ...]
+        elif m is MedSAMFPN:
+            # Passthrough: same pattern as DINOv3FPN
+            # YAML args: [checkpoint, freeze, image_size]
+            # tasks.py prepends input_channels → [checkpoint, input_ch, freeze, image_size]
+            c1 = ch[f]
+            c2 = c1
+            args = [args[0], c1, *args[1:]]  # [checkpoint, input_channels, freeze, image_size]
+        elif m is MedSAMCrossFusion:
+            # Cross-attention fusion; c2 = c1 (residual)
+            # YAML args: [scale, num_heads]
+            # tasks.py prepends channels → [channels, scale, num_heads, ...]
+            c1 = ch[f]
+            c2 = c1
             args = [c1, *args]  # [channels, scale, num_heads, ...]
         elif m is CBFuse:
             c2 = ch[f[-1]]
