@@ -143,26 +143,26 @@ pip install torch torchvision ultralytics transformers timm huggingface_hub
 ```
 Data All/
 ├── images/
-│   ├── primary/          ← Orientation 1  (ต้องมี label)
+│   ├── primary/          ← Orientation 1  (labels required)
 │   │   ├── train/
 │   │   │   ├── img001.jpg
 │   │   │   └── ...
 │   │   ├── val/
 │   │   └── test/
-│   ├── detail1/          ← Orientation 2  (ไม่ต้อง label)
+│   ├── detail1/          ← Orientation 2  (no labels needed)
 │   │   ├── train/
-│   │   │   ├── img001.jpg   ← ชื่อไฟล์ต้องตรงกับ primary ทุกไฟล์
+│   │   │   ├── img001.jpg   ← filename must match primary exactly
 │   │   │   └── ...
 │   │   ├── val/
 │   │   └── test/
-│   └── detail2/          ← Orientation 3  (ไม่ต้อง label)
+│   └── detail2/          ← Orientation 3  (no labels needed)
 │       ├── train/
-│       │   ├── img001.jpg   ← ชื่อไฟล์ต้องตรงกับ primary ทุกไฟล์
+│       │   ├── img001.jpg   ← filename must match primary exactly
 │       │   └── ...
 │       ├── val/
 │       └── test/
 └── labels/
-    └── primary/          ← Label อยู่ที่นี่เท่านั้น
+    └── primary/          ← labels go here only
         ├── train/
         │   ├── img001.txt   ← YOLO format  (class cx cy w h)
         │   └── ...
@@ -172,11 +172,11 @@ Data All/
 
 ### Label Rule
 
-| Folder | ต้อง Label? | เหตุผล |
-|--------|------------|--------|
-| `primary/` | **ต้อง** | Reference orientation — dataset โหลด label จากที่นี่เท่านั้น |
-| `detail1/` | **ไม่ต้อง** | Stack เข้า channel 4-6 อัตโนมัติ ใช้ label เดียวกับ primary |
-| `detail2/` | **ไม่ต้อง** | Stack เข้า channel 7-9 อัตโนมัติ ใช้ label เดียวกับ primary |
+| Folder | Labels Required? | Reason |
+|--------|-----------------|--------|
+| `primary/` | **Yes** | Reference orientation — dataset loads labels from here only |
+| `detail1/` | **No** | Stacked into channels 4–6 automatically; shares labels with primary |
+| `detail2/` | **No** | Stacked into channels 7–9 automatically; shares labels with primary |
 
 ### How Triple Input Works
 
@@ -185,11 +185,11 @@ primary/img001.jpg   (3ch)  ─┐
 detail1/img001.jpg   (3ch)  ─┼─ stack → 9-channel input → YOLOv26-GPR
 detail2/img001.jpg   (3ch)  ─┘
 
-label: labels/primary/img001.txt  (bounding box ใช้ coordinate ของ primary)
+label: labels/primary/img001.txt  (bounding box coordinates from primary)
 ```
 
-> **ข้อสำคัญ:** ชื่อไฟล์ใน `detail1/` และ `detail2/` ต้องตรงกับ `primary/` ทุกตัว
-> หากไฟล์ไม่พบ dataset จะแทนด้วย zero tensor อัตโนมัติ (ไม่ crash)
+> **Important:** Filenames in `detail1/` and `detail2/` must exactly match those in `primary/`.
+> If a file is missing, the dataset automatically substitutes a zero tensor — no crash.
 
 ---
 
