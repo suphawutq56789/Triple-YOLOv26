@@ -131,7 +131,7 @@ MedSAM: `wanglab/medsam-vit-base` (ViT-B, dim=768, patch16, trained on 1.5M medi
 git clone https://github.com/suphawutq56789/Triple-YOLOv26.git
 cd Triple-YOLOv26
 
-pip install torch torchvision ultralytics transformers timm huggingface_hub
+pip install -r requirements.txt
 ```
 
 ---
