@@ -280,6 +280,8 @@ Examples:
   python train_medsam.py --compare                    # MedSAM vs DINOv3
         """
     )
+    parser.add_argument("--data",     default=None,
+                        help="Path to data yaml (default: data_all.yaml)")
     parser.add_argument("--scale",    default="s",  choices=["n", "s", "m", "l"],
                         help="Model scale (s=recommended for ~2700 imgs, m=better but slower)")
     parser.add_argument("--epochs",   type=int, default=100,
@@ -295,6 +297,10 @@ Examples:
     parser.add_argument("--compare",  action="store_true",
                         help="Run comparison: MedSAM vs DINOv3 with same hyperparams")
     args = parser.parse_args()
+
+    global DATA_CONFIG
+    if args.data:
+        DATA_CONFIG = args.data
 
     print_banner("YOLOv26-GPR-MedSAM Training")
     print(f"  Model:    {MODEL_CONFIG}")
