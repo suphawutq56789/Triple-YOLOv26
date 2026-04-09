@@ -1381,10 +1381,10 @@ class RandomHSV:
             else:
                 # Multi-channel (e.g. 9-channel triple input): apply HSV per 3-channel slice
                 for start in range(0, nc, 3):
-                    ch = img[:, :, start:start + 3]
+                    ch = np.ascontiguousarray(img[:, :, start:start + 3])
                     hue, sat, val = cv2.split(cv2.cvtColor(ch, cv2.COLOR_BGR2HSV))
                     im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
-                    cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=ch)
+                    img[:, :, start:start + 3] = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR)
         return labels
 
 
