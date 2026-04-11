@@ -221,6 +221,86 @@ def phase2(weights: str, epochs: int, batch: int, imgsz: int, scale: str,
 
 # ---------------------------------------------------------------------------
 
+def train_unified(scale: str, epochs: int, batch: int, imgsz: int,
+                  unfreeze_epoch: int = None) -> Path:
+    """
+    Single-run training: freeze MedSAM for first N epochs, then unfreeze.
+    Equivalent to Phase 1 + Phase 2 but without restarting.
+
+    Uses YOLO callback 'on_train_epoch_end' to unfreeze ViT mid-training
+    and drop LR 10x at the same epoch.
+
+    Args:
+        unfreeze_epoch: epoch to unfreeze MedSAM (default: epochs * 2/3)
+    """
+    if unfreeze_epoch is None:
+        unfreeze_epoch = int(epochs * 2 / 3)  # e.g. epoch 100 of 150
+
+    run_name = f"unified_{scale}"
+    print_banner(f"UNIFIED TRAINING  |  scale={scale}  epochs={epochs}  batch={batch}")
+    print(f"  Epoch 1-{unfreeze_epoch}:   MedSAM FROZEN   (CNN + CrossFusion train)")
+    print(f"  Epoch {unfreeze_epoch+1}-{epochs}: MedSAM UNFROZEN (full fine-tune, LR /10)")
+    print(f"  γ starts at 0 → opens gradually throughout")
+
+    model = YOLO(MODEL_CONFIG)
+    unfrozen = {"done": False}
+
+    def on_epoch_end(trainer):
+        epoch = trainer.epoch + 1  # trainer.epoch is 0-indexed
+        if epoch >= unfreeze_epoch and not unfrozen["done"]:
+            unfrozen["done"] = True
+            from ultralytics.nn.modules import MedSAMFPN
+            total = 0
+            for layer in trainer.model.model:
+                if isinstance(layer, MedSAMFPN):
+                    layer.freeze = False
+                    for p in layer.vit.parameters():
+                        p.requires_grad = True
+                    total = sum(p.numel() for p in layer.vit.parameters())
+            # drop LR 10x for all param groups
+            for pg in trainer.optimizer.param_groups:
+                pg["lr"] *= 0.1
+            print(f"\n  [Epoch {epoch}] MedSAM unfrozen ({total/1e6:.1f}M params), LR /10")
+            gamma_report(trainer.model)
+
+    model.add_callback("on_train_epoch_end", on_epoch_end)
+
+    model.train(
+        data=DATA_CONFIG,
+        epochs=epochs,
+        imgsz=imgsz,
+        batch=batch,
+
+        optimizer="AdamW",
+        lr0=0.002,
+        lrf=0.01,
+        weight_decay=0.01,
+        warmup_epochs=5,
+
+        box=7.5,
+        cls=0.5,
+        dfl=1.5,
+
+        **GPR_AUG,
+        mosaic=1.0,
+        copy_paste=0.3,
+
+        project=PROJECT,
+        name=run_name,
+        exist_ok=True,
+        plots=True,
+        save_period=20,
+        patience=40,
+        verbose=True,
+    )
+
+    best = Path(f"{PROJECT}/{run_name}/weights/best.pt")
+    print(f"\n  Unified training done → {best}")
+    return best
+
+
+# ---------------------------------------------------------------------------
+
 def compare(scale: str, epochs: int, batch: int, imgsz: int):
     """
     Run both MedSAM and DINOv3 versions back-to-back for fair comparison.
@@ -296,6 +376,10 @@ Examples:
                         help="Start from existing weights (skips phase 1, goes to phase 2)")
     parser.add_argument("--compare",  action="store_true",
                         help="Run comparison: MedSAM vs DINOv3 with same hyperparams")
+    parser.add_argument("--unified",  action="store_true",
+                        help="Single-run training: auto-unfreeze MedSAM at epoch 2/3")
+    parser.add_argument("--unfreeze-epoch", type=int, default=None,
+                        help="Epoch to unfreeze MedSAM in unified mode (default: epochs*2/3)")
     args = parser.parse_args()
 
     global DATA_CONFIG
@@ -311,7 +395,11 @@ Examples:
     print(f"  ImgSz:    {args.imgsz}")
     print(f"  Project:  {PROJECT}/")
 
-    if args.compare:
+    if args.unified:
+        train_unified(args.scale, args.epochs, args.batch, args.imgsz,
+                      unfreeze_epoch=args.unfreeze_epoch)
+
+    elif args.compare:
         compare(args.scale, args.epochs, args.batch, args.imgsz)
 
     elif args.weights:
