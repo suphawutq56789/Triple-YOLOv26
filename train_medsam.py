@@ -87,6 +87,33 @@ def gamma_report(model):
             print(f"    {scale:3s}  γ={g:.4f}  {bar}")
 
 
+def freeze_gamma(model):
+    """Freeze all CrossFusion γ params (keep them at 0 during phase1).
+    Without this, gamma learns to blend frozen medical-domain ViT features
+    into the CNN stream, which hurts GPR detection (domain mismatch noise).
+    """
+    from ultralytics.nn.modules import MedSAMCrossFusion
+    n = 0
+    for m in model.model.modules():
+        if isinstance(m, MedSAMCrossFusion):
+            m.gamma.requires_grad_(False)
+            n += 1
+    if n:
+        print(f"  γ frozen for {n} CrossFusion layers (will unfreeze in phase2)")
+
+
+def unfreeze_gamma(model):
+    """Unfreeze CrossFusion γ params for phase2."""
+    from ultralytics.nn.modules import MedSAMCrossFusion
+    n = 0
+    for m in model.model.modules():
+        if isinstance(m, MedSAMCrossFusion):
+            m.gamma.requires_grad_(True)
+            n += 1
+    if n:
+        print(f"  γ unfrozen for {n} CrossFusion layers")
+
+
 # ---------------------------------------------------------------------------
 
 def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "") -> Path:
@@ -100,10 +127,15 @@ def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "
     run_name = f"phase1_{scale}{name_suffix}"
     print_banner(f"PHASE 1  |  scale={scale}  epochs={epochs}  batch={batch}  imgsz={imgsz}")
     print("  MedSAM ViT-B: FROZEN (87.3M params)")
-    print("  Training:     CNN backbone + MedSAMCrossFusion (3.4M params)")
-    print("  γ starts at 0 → identity; opens gradually during training")
+    print("  Training:     CNN backbone only — γ FROZEN at 0")
+    print("  Rationale:    MedSAM features are medical-domain; blending them")
+    print("                before phase2 domain-adapt hurts GPR detection.")
 
     model = YOLO(MODEL_CONFIG)
+
+    # Freeze γ so CrossFusion stays identity during phase1.
+    # CNN trains to ~baseline performance; phase2 then unfreezes γ + ViT together.
+    freeze_gamma(model)
 
     # Report initial γ (should all be 0.0)
     gamma_report(model)
@@ -179,6 +211,9 @@ def phase2(weights: str, epochs: int, batch: int, imgsz: int, scale: str,
                 p.requires_grad = True
             unfrozen_params = sum(p.numel() for p in layer.vit.parameters())
             print(f"  Unfroze MedSAMFPN ViT — {unfrozen_params/1e6:.1f}M params now trainable")
+
+    # Unfreeze γ — now ViT is also adapting so CrossFusion can learn properly
+    unfreeze_gamma(model)
 
     total_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
     print(f"  Total trainable: {total_trainable/1e6:.1f}M params")
