@@ -161,7 +161,8 @@ def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "
         # GPR-safe augmentation
         **GPR_AUG,
         mosaic=1.0,
-        copy_paste=0.3,      # paste extra void patches — helps rare class
+        copy_paste=0.5,      # paste extra void patches — helps rare class
+        mixup=0.1,           # blend pairs → regularize, reduce overfit
 
         # Logging
         project=PROJECT,
@@ -318,7 +319,8 @@ def train_unified(scale: str, epochs: int, batch: int, imgsz: int,
 
         **GPR_AUG,
         mosaic=1.0,
-        copy_paste=0.3,
+        copy_paste=0.5,
+        mixup=0.1,
 
         project=PROJECT,
         name=run_name,
@@ -354,7 +356,7 @@ def compare(scale: str, epochs: int, batch: int, imgsz: int):
         data=DATA_CONFIG, epochs=epochs, imgsz=imgsz, batch=batch,
         optimizer="AdamW", lr0=0.002, lrf=0.01, weight_decay=0.01,
         warmup_epochs=5, box=7.5, cls=0.5, dfl=1.5,
-        **GPR_AUG, mosaic=1.0, copy_paste=0.3,
+        **GPR_AUG, mosaic=1.0, copy_paste=0.5, mixup=0.1,
         project=PROJECT, name=f"compare_medsam_{scale}",
         exist_ok=True, plots=True, patience=30,
     )
