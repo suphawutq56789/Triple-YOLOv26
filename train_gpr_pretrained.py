@@ -58,7 +58,7 @@ def load_pretrained_backbone(our_model, pretrained_path: str) -> int:
     return n_matched
 
 
-def train(scale: str, epochs: int, batch: int, imgsz: int, data: str):
+def train(scale: str, epochs: int, batch: int, imgsz: int, data: str, pretrained: str = PRETRAINED):
     print("=" * 60)
     print(f"scale={scale}  epochs={epochs}  batch={batch}  imgsz={imgsz}")
     print("YOLOv26s pretrained + DINOv3 frozen — training CNN + CrossFusion")
@@ -69,7 +69,7 @@ def train(scale: str, epochs: int, batch: int, imgsz: int, data: str):
     model = YOLO(MODEL_CONFIG)
 
     # 2. Partial-load yolo26s pretrained backbone
-    load_pretrained_backbone(model.model, PRETRAINED)
+    load_pretrained_backbone(model.model, pretrained)
 
     # 3. Train
     model.train(
@@ -127,10 +127,9 @@ def main():
                         help="Path or hub name for yolo26s weights")
     args = parser.parse_args()
 
-    global PRETRAINED
-    PRETRAINED = args.pretrained
+    pretrained = args.pretrained
 
-    train(args.scale, args.epochs, args.batch, args.imgsz, args.data)
+    train(args.scale, args.epochs, args.batch, args.imgsz, args.data, pretrained)
 
 
 if __name__ == "__main__":
