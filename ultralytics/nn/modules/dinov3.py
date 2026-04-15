@@ -1171,6 +1171,24 @@ class DINOv3FPN(nn.Module):
             self.dino_model.eval()
         return self
 
+    def __getstate__(self):
+        """Remove unpicklable HuggingFace internal hooks before serialization.
+
+        HuggingFace registers local-closure hooks (e.g. install_output_capuring_hook)
+        during forward passes that cannot be pickled by torch.save.  We clear them
+        here; they are not needed for our feature-extraction use case.
+        """
+        if self.dino_model is not None:
+            for module in self.dino_model.modules():
+                module._forward_hooks.clear()
+                module._forward_pre_hooks.clear()
+                module._backward_hooks.clear()
+        return self.__dict__.copy()
+
+    def __setstate__(self, state):
+        """Restore state after deserialization."""
+        self.__dict__.update(state)
+
     def __repr__(self):
         return (
             f"DINOv3FPN(model={self.model_name!r}, "

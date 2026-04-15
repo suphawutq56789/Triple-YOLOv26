@@ -29,7 +29,7 @@ scales:
 dinov3:
   model_name: "facebook/dinov3-vits16-pretrain-lvd1689m"  # ViT-S/16 (dim=384), trained on LVD-1.6B
   freeze: true                                              # keep ViT frozen (recommended for small dataset)
-  image_size: 224
+  image_size: 640
 
 backbone:
   # [from, repeats, module, args]
@@ -37,7 +37,7 @@ backbone:
   # --- DINOv3 Feature Pyramid pre-extractor ---
   # Runs ViT once on the 9-ch input; caches features at P3/P4/P5 ViT depths.
   # Passthrough: returns original 9-ch tensor unchanged (c2 = c1).
-  - [-1, 1, DINOv3FPN, ["facebook/dinov3-vits16-pretrain-lvd1689m", true, 224]]  # 0  passthrough (c2=9ch)
+  - [-1, 1, DINOv3FPN, ["facebook/dinov3-vits16-pretrain-lvd1689m", true, 640]]  # 0  passthrough (c2=9ch)
 
   # --- CNN stem ---
   - [-1, 1, Conv,  [64, 3, 2]]                                 # 1  P1/2
