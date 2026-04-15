@@ -34,32 +34,28 @@ Usage:
 """
 
 import argparse
-import os
-import tempfile
 import warnings
 from pathlib import Path
 
-import yaml as yaml_lib
 from ultralytics import YOLO
 
 warnings.filterwarnings("ignore")
 
 
 def load_model_with_scale(config_path: str, scale: str) -> YOLO:
-    """Load YOLO model config with the specified scale injected."""
+    """Load YOLO model config with the specified scale injected.
+
+    Writes a persistent sibling file (e.g. _scale_m.yaml) so the
+    trainer can reload it throughout training without a deleted tempfile.
+    """
+    cfg_path = Path(config_path)
+    out_path = cfg_path.parent / f"_scale_{scale}.yaml"
     with open(config_path, "r") as f:
-        cfg = yaml_lib.safe_load(f)
-    cfg["scale"] = scale
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, dir=tempfile.gettempdir()
-    ) as f:
-        yaml_lib.dump(cfg, f)
-        tmp_path = f.name
-    try:
-        model = YOLO(tmp_path)
-    finally:
-        os.unlink(tmp_path)
-    return model
+        original = f.read()
+    # Prepend 'scale: <x>' so it takes priority over any existing key
+    with open(out_path, "w") as f:
+        f.write(f"scale: {scale}\n" + original)
+    return YOLO(str(out_path))
 
 DATA_CONFIG       = "data_all.yaml"
 MODEL_CONFIG      = "ultralytics/cfg/models/v26/yolov26_gpr_medsam.yaml"
