@@ -65,7 +65,7 @@ def load_model_with_scale(config_path: str, scale: str) -> YOLO:
         cfg = _yaml.safe_load(f)
 
     # Keep only the target scale so tuple(scales.keys())[0] picks it
-    cfg["scales"] = {"n": _SCALES[scale]}
+    cfg["scales"] = {scale: _SCALES[scale]}
     cfg.pop("scale", None)   # remove any leftover scale key
 
     with open(out_path, "w") as f:
