@@ -34,11 +34,32 @@ Usage:
 """
 
 import argparse
+import os
+import tempfile
 import warnings
 from pathlib import Path
+
+import yaml as yaml_lib
 from ultralytics import YOLO
 
 warnings.filterwarnings("ignore")
+
+
+def load_model_with_scale(config_path: str, scale: str) -> YOLO:
+    """Load YOLO model config with the specified scale injected."""
+    with open(config_path, "r") as f:
+        cfg = yaml_lib.safe_load(f)
+    cfg["scale"] = scale
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, dir=tempfile.gettempdir()
+    ) as f:
+        yaml_lib.dump(cfg, f)
+        tmp_path = f.name
+    try:
+        model = YOLO(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+    return model
 
 DATA_CONFIG       = "data_all.yaml"
 MODEL_CONFIG      = "ultralytics/cfg/models/v26/yolov26_gpr_medsam.yaml"
@@ -131,7 +152,7 @@ def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "
     print("  Rationale:    MedSAM features are medical-domain; blending them")
     print("                before phase2 domain-adapt hurts GPR detection.")
 
-    model = YOLO(MODEL_CONFIG)
+    model = load_model_with_scale(MODEL_CONFIG, scale)
 
     # Freeze γ so CrossFusion stays identity during phase1.
     # CNN trains to ~baseline performance; phase2 then unfreezes γ + ViT together.
@@ -280,7 +301,7 @@ def train_unified(scale: str, epochs: int, batch: int, imgsz: int,
     print(f"  Epoch {unfreeze_epoch+1}-{epochs}: MedSAM UNFROZEN (full fine-tune, LR /10)")
     print(f"  γ starts at 0 → opens gradually throughout")
 
-    model = YOLO(MODEL_CONFIG)
+    model = load_model_with_scale(MODEL_CONFIG, scale)
     unfrozen = {"done": False}
 
     def on_epoch_end(trainer):
@@ -354,7 +375,7 @@ def compare(scale: str, epochs: int, batch: int, imgsz: int):
 
     # --- MedSAM ---
     print_banner("  [1/2] YOLOv26 + MedSAM ViT-B")
-    model_m = YOLO(MODEL_CONFIG)
+    model_m = load_model_with_scale(MODEL_CONFIG, scale)
     model_m.train(
         data=DATA_CONFIG, epochs=epochs, imgsz=imgsz, batch=batch,
         optimizer="AdamW", lr0=0.002, lrf=0.01, weight_decay=0.01,
@@ -367,7 +388,7 @@ def compare(scale: str, epochs: int, batch: int, imgsz: int):
 
     # --- DINOv3 ---
     print_banner("  [2/2] YOLOv26 + DINOv3 ViT-S")
-    model_d = YOLO(DINOV3_CONFIG)
+    model_d = load_model_with_scale(DINOV3_CONFIG, scale)
     model_d.train(
         data=DATA_CONFIG, epochs=epochs, imgsz=imgsz, batch=batch,
         optimizer="AdamW", lr0=0.002, lrf=0.01, weight_decay=0.01,
@@ -459,7 +480,7 @@ Examples:
             phase2(
                 weights=str(best),
                 epochs=max(30, args.epochs // 2),
-                batch=max(1, args.batch // 2),
+                batch=args.batch,   # keep same batch as phase1
                 imgsz=args.imgsz,
                 scale=args.scale,
             )
