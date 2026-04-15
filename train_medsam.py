@@ -149,6 +149,54 @@ def unfreeze_gamma(model):
 
 # ---------------------------------------------------------------------------
 
+PRETRAINED_TRIPLE = "runs/detect/yolov12_triple_pretrained4/weights/best.pt"
+
+# Mapping: pretrained triple layer index → MedSAM model layer index
+# Only layers with matching weight shapes are included.
+_BACKBONE_MAP = {1: 2, 2: 3, 3: 4, 4: 5, 5: 7, 6: 8, 7: 10, 8: 11}
+_HEAD_MAP     = {11: 15, 14: 18, 15: 19, 17: 21, 18: 22, 20: 24, 21: 25}
+
+
+def transfer_pretrained_backbone(model, pretrained_path: str = PRETRAINED_TRIPLE):
+    """Copy matching CNN + head weights from pretrained triple model into MedSAM model.
+
+    pretrained4 (yolov26_triple, nc=1) shares the same CNN backbone and head
+    as the MedSAM model — only the ViT/CrossFusion layers differ.
+    Transferring these weights gives phase1 a strong starting point (~0.42)
+    instead of training from scratch (~0.26).
+    """
+    import torch
+    if not Path(pretrained_path).exists():
+        print(f"  [transfer] {pretrained_path} not found — skipping pretrained transfer")
+        return
+
+    ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+    src_sd = ckpt["model"].float().state_dict() if hasattr(ckpt.get("model", None), "state_dict") else ckpt
+    dst_sd = model.model.state_dict()
+
+    layer_map = {**_BACKBONE_MAP, **_HEAD_MAP}
+    copied, skipped = 0, 0
+    new_sd = {k: v.clone() for k, v in dst_sd.items()}
+
+    for src_idx, dst_idx in layer_map.items():
+        src_prefix = f"model.{src_idx}."
+        dst_prefix = f"model.{dst_idx}."
+        for src_key, src_val in src_sd.items():
+            if not src_key.startswith(src_prefix):
+                continue
+            dst_key = dst_prefix + src_key[len(src_prefix):]
+            if dst_key in new_sd and new_sd[dst_key].shape == src_val.shape:
+                new_sd[dst_key] = src_val.clone()
+                copied += 1
+            else:
+                skipped += 1
+
+    model.model.load_state_dict(new_sd, strict=False)
+    total = copied + skipped
+    print(f"  [transfer] Loaded pretrained backbone: {copied}/{total} tensors copied"
+          f"  ({skipped} skipped — shape mismatch or MedSAM-only layers)")
+
+
 def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "") -> Path:
     """
     Phase 1: MedSAM ViT-B frozen.
@@ -166,11 +214,12 @@ def phase1(scale: str, epochs: int, batch: int, imgsz: int, name_suffix: str = "
 
     model = load_model_with_scale(MODEL_CONFIG, scale)
 
-    # Freeze γ so CrossFusion stays identity during phase1.
-    # CNN trains to ~baseline performance; phase2 then unfreezes γ + ViT together.
-    freeze_gamma(model)
+    # Warm-start CNN + head from pretrained triple model (avoids training from scratch)
+    transfer_pretrained_backbone(model)
 
-    # Report initial γ (should all be 0.0)
+    # γ starts at 0 (init) but is FREE to learn — CrossFusion can gradually blend
+    # frozen medical MedSAM features into CNN during phase1.
+    # This makes phase2 transition smoother (only ViT unfreezes, γ already learned).
     gamma_report(model)
 
     model.train(
@@ -274,14 +323,14 @@ def phase2(weights: str, epochs: int, batch: int, imgsz: int, scale: str,
         **GPR_AUG,
         mosaic=0.5,
         close_mosaic=10,
-        copy_paste=0.1,
+        copy_paste=0.3,
 
         project=PROJECT,
         name=run_name,
         exist_ok=True,
         plots=True,
         save_period=10,
-        patience=30,
+        patience=50,
         verbose=True,
     )
 
